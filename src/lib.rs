@@ -281,32 +281,6 @@ impl Counter {
     }
 
 
-    pub fn initialize(&mut self, owners: Vec<Address>, num_confirmations_required: U256) -> Result<(), MultiSigError> {
-        if owners.len() == 0 {
-            return Err(MultiSigError::ZeroOwners(ZeroOwners{}));
-        }
-
-        if num_confirmations_required == U256::from(0) || num_confirmations_required > U256::from(owners.len()) {
-            panic!("invalid number of required confirmations");
-        }
-
-        for owner in owners.iter() {
-            if *owner == Address::zero() {
-                panic!("invalid owner");
-            }
-
-            if self.is_owner.get(*owner) {
-                panic!("owner not unique");
-            }
-
-            self.is_owner.setter(*owner).set(true);
-            self.owners.push(*owner);
-        }
-
-        self.num_confirmations_required.set(num_confirmations_required);
-        Ok(())
-    }
-
     pub fn execute_transaction(&mut self, tx_index: U256) -> Result<(), MultiSigError>{
         let tx_index = tx_index.to::<usize>();
         if tx_index >= self.transactions.len() {
