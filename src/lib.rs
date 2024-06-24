@@ -182,19 +182,6 @@ impl Counter {
         }
     }
 
-    // function confirmTransaction(uint256 _txIndex)
-    //     public
-    //     onlyOwner
-    //     txExists(_txIndex)
-    //     notExecuted(_txIndex)
-    //     notConfirmed(_txIndex)
-    // {
-    //     Transaction storage transaction = transactions[_txIndex];
-    //     transaction.numConfirmations += 1;
-    //     isConfirmed[_txIndex][msg.sender] = true;
-
-    //     emit ConfirmTransaction(msg.sender, _txIndex);
-    // }
 
     pub fn confirm_transaction(&mut self, tx_index: U256) -> Result<(), MultiSigError> {
         if !self.is_owner(msg::sender()) {
