@@ -182,7 +182,59 @@ impl Counter {
         }
     }
 
+    // function confirmTransaction(uint256 _txIndex)
+    //     public
+    //     onlyOwner
+    //     txExists(_txIndex)
+    //     notExecuted(_txIndex)
+    //     notConfirmed(_txIndex)
+    // {
+    //     Transaction storage transaction = transactions[_txIndex];
+    //     transaction.numConfirmations += 1;
+    //     isConfirmed[_txIndex][msg.sender] = true;
+
+    //     emit ConfirmTransaction(msg.sender, _txIndex);
+    // }
+
+    pub fn confirm_transaction(&mut self, tx_index: U256) -> Result<(), MultiSigError> {
+        if !self.is_owner(msg::sender()) {
+            return Err(MultiSigError::NotOwner(NotOwner{}));
+        }
+
+        // let tx_index = tx_index.to;
+        if tx_index >= U256::from(self.transactions.len()) {
+            return Err(MultiSigError::TxDoesNotExist(TxDoesNotExist{}));
+        }
+
+        if let Some(mut entry) = self.transactions.get_mut(tx_index) {
+            if entry.executed.get() {
+                return Err(MultiSigError::TxAlreadyExecuted(TxAlreadyExecuted{}));
+            }
+
+            if self.is_confirmed.get(tx_index).get(msg::sender()) {
+                return Err(MultiSigError::TxAlreadyConfirmed(TxAlreadyConfirmed{}));
+            }
+
+            let num_confirmations = entry.num_confirmations.get();
+            entry.num_confirmations.set(num_confirmations + U256::from(1));
+            let mut tx_confirmed_info = self.is_confirmed.setter(tx_index);
+            let mut confirmed_by_address = tx_confirmed_info.setter(msg::sender());
+            confirmed_by_address.set(true);
+
+            evm::log(ConfirmTransaction {
+                owner: msg::sender(),
+                txIndex: U256::from(tx_index),
+            });
+            Ok(())
+        } else {
+            return Err(MultiSigError::TxDoesNotExist(TxDoesNotExist{}));
+        }
+    }
+
     pub fn revoke_confirmation(&mut self, tx_index: U256) -> Result<(), MultiSigError> {
+        if !self.is_owner(msg::sender()) {
+            return Err(MultiSigError::NotOwner(NotOwner{}));
+        }
         // let tx_index = tx_index.to;
         if tx_index >= U256::from(self.transactions.len()) {
             return Err(MultiSigError::TxDoesNotExist(TxDoesNotExist{}));
@@ -209,8 +261,16 @@ impl Counter {
         }
     }
 
-    pub fn is_owner(&self, owner: Address) -> bool {
-        self.is_owner.get(owner)
+    pub fn is_owner(&self, check_address: Address) -> bool {
+        let mut i = 0;
+        let len = self.owners.len();
+        while i < len {
+            if self.owners.get(i) == Some(check_address) {
+                return true;
+            }
+            i += 1;
+        }
+        return false;
     }
 
     pub fn get_transaction_count(&self) -> U256 {
