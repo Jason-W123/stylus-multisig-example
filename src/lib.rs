@@ -7,9 +7,10 @@ extern crate alloc;
 static ALLOC: mini_alloc::MiniAlloc = mini_alloc::MiniAlloc::INIT;
 
 /// Import items from the SDK. The prelude contains common traits and macros.
-use stylus_sdk::{contract, evm, msg, prelude::*, call::{Call, call}, alloy_primitives::{Address, U256}};
+use stylus_sdk::{contract, evm, msg, prelude::*, call::{Call, call}, alloy_primitives::{Address, U256}, abi::Bytes};
 use alloy_sol_types::sol;
-// 
+
+// Define some events using the Solidity ABI.
 sol! {
     event Deposit(address indexed sender, uint256 amount, uint256 balance);
     event SubmitTransaction(
@@ -23,6 +24,7 @@ sol! {
     event RevokeConfirmation(address indexed owner, uint256 indexed txIndex);
     event ExecuteTransaction(address indexed owner, uint256 indexed txIndex);
 
+    // Error types for the MultiSig contract
     error AlreadyInitialized();
     error ZeroOwners();
     error InvaildConfirmationNumber();
@@ -38,29 +40,29 @@ sol! {
 }
 
 // Define some persistent storage using the Solidity ABI.
-// `Counter` will be the entrypoint.
+// `MultiSig` will be the entrypoint.
 sol_storage! {
     #[entrypoint]
-    pub struct Counter {
-        address[] owners;
-        mapping(address => bool) is_owner;
-        uint256 num_confirmations_required;
-        uint256 number;
-        TxStruct[] transactions;
+    pub struct MultiSig {
+        address[] owners; // The addresses of the owners
+        mapping(address => bool) is_owner; // mapping from owner => bool
+        uint256 num_confirmations_required; // The number of confirmations required to execute a transaction
+        TxStruct[] transactions; // The transactions array
         // mapping from tx index => owner => bool
         mapping(uint256 => mapping(address => bool)) is_confirmed;
     }
 
+    // Define the `TxStruct` struct
     pub struct TxStruct {
         address to;
         uint256 value;
         bytes data;
-        bool executed;
-        uint256 num_confirmations;
+        bool executed; // Whether the transaction has been executed
+        uint256 num_confirmations; // The number of confirmations of the current transaction
     }
 }
 
-// Error types for the TimeLock contract
+// Error types for the MultiSig contract
 #[derive(SolidityError)]
 pub enum MultiSigError {
     AlreadyInitialized(AlreadyInitialized),
@@ -77,13 +79,14 @@ pub enum MultiSigError {
     ExecuteFailed(ExecuteFailed),
 }
 
-/// Declare that `Counter` is a contract with the following external methods.
+/// Declare that `MultiSig` is a contract with the following external methods.
 #[external]
-impl Counter {
+impl MultiSig {
     pub fn num_confirmations_required(&self) -> Result<U256, MultiSigError> {
         Ok(self.num_confirmations_required.get())
     }
 
+    // The `deposit` method is payable, so it can receive funds.
     #[payable]
     pub fn deposit(&mut self) {
         let sender = msg::sender();
@@ -96,7 +99,13 @@ impl Counter {
             });
     }
 
-    pub fn submit_transaction(&mut self, to: Address, value: U256, data: Vec<u8>) {
+    // The `submit_transaction` method submits a new transaction to the contract.
+    pub fn submit_transaction(&mut self, to: Address, value: U256, data: Bytes) -> Result<(), MultiSigError> {
+        // The sender must be an owner.
+        if !self.is_owner.get(msg::sender()) {
+            return Err(MultiSigError::NotOwner(NotOwner{}));
+        }
+
         let tx_index = U256::from(self.transactions.len());
         
         let mut new_tx = self.transactions.grow();
@@ -111,25 +120,30 @@ impl Counter {
             txIndex: tx_index,
             to: to,
             value: value,
-            data: data.clone(),
+            data: data.to_vec(),
         });
+        Ok(())
     }
 
 
-
+    // The `initialize` method initializes the contract with the owners and the number of confirmations required.
     pub fn initialize(&mut self, owners: Vec<Address>, num_confirmations_required: U256) -> Result<(), MultiSigError> {
+        // The owners must not be initialized.
         if self.owners.len() > 0 {
             return Err(MultiSigError::AlreadyInitialized(AlreadyInitialized{}));
         }
 
+        // The owners must not be empty.
         if owners.len() == 0 {
             return Err(MultiSigError::ZeroOwners(ZeroOwners{}));
         }
 
+        // The number of confirmations required must be greater than 0 and less than or equal to the number of owners.
         if num_confirmations_required == U256::from(0) || num_confirmations_required > U256::from(owners.len()) {
             return Err(MultiSigError::InvaildConfirmationNumber(InvaildConfirmationNumber{}));
         }
 
+        // Add the owners to the contract.
         for owner in owners.iter() {
             if *owner == Address::default() {
                 return Err(MultiSigError::InvalidOwner(InvalidOwner{}))
@@ -143,16 +157,25 @@ impl Counter {
             self.owners.push(*owner);
         }
 
+        // Set the number of confirmations required.
         self.num_confirmations_required.set(num_confirmations_required);
         Ok(())
     }
 
+    // The `execute_transaction` method executes a transaction.
     pub fn execute_transaction(&mut self, tx_index: U256) -> Result<(), MultiSigError>{
+        // The sender must be an owner.
+        if !self.is_owner.get(msg::sender()) {
+            return Err(MultiSigError::NotOwner(NotOwner{}));
+        }
+
+        // The transaction must exist.
         let tx_index = tx_index.to::<usize>();
         if tx_index >= self.transactions.len() {
             return Err(MultiSigError::TxDoesNotExist(TxDoesNotExist{}));
         }
 
+        // Try get transaction and check transaction is valid or not, if valid, execute it, if not, revert tx.
         if let Some(mut entry) = self.transactions.get_mut(tx_index) {
             if entry.executed.get() {
                 return Err(MultiSigError::TxAlreadyExecuted(TxAlreadyExecuted{}));
@@ -163,8 +186,10 @@ impl Counter {
             }
             
             entry.executed.set(true);
-            // let executed_setter = entry.executed.setter();
+            
+            // Execute the transaction
             match call(Call::new().value(entry.value.get()), entry.to.get(), &entry.data.get_bytes()) {
+                // If the transaction is successful, emit the `ExecuteTransaction` event.
                 Ok(_) => {
                     evm::log(ExecuteTransaction {
                         owner: msg::sender(),
@@ -172,6 +197,7 @@ impl Counter {
                     });
                     Ok(())
                 },
+                // If the transaction fails, revert the transaction.
                 Err(_) => {
                     return Err(MultiSigError::ExecuteFailed(ExecuteFailed{}));
                 }
@@ -182,17 +208,19 @@ impl Counter {
         }
     }
 
-
+    // The `confirm_transaction` method confirms a transaction.
     pub fn confirm_transaction(&mut self, tx_index: U256) -> Result<(), MultiSigError> {
-        if !self.is_owner(msg::sender()) {
+        // The sender must be an owner.
+        if !self.is_owner.get(msg::sender()) {
             return Err(MultiSigError::NotOwner(NotOwner{}));
         }
 
-        // let tx_index = tx_index.to;
+        // The transaction must exist.
         if tx_index >= U256::from(self.transactions.len()) {
             return Err(MultiSigError::TxDoesNotExist(TxDoesNotExist{}));
         }
 
+        // Try get transaction and check transaction is valid or not, if valid, confirm it, if not, revert tx.
         if let Some(mut entry) = self.transactions.get_mut(tx_index) {
             if entry.executed.get() {
                 return Err(MultiSigError::TxAlreadyExecuted(TxAlreadyExecuted{}));
@@ -202,12 +230,15 @@ impl Counter {
                 return Err(MultiSigError::TxAlreadyConfirmed(TxAlreadyConfirmed{}));
             }
 
+            // Confirm the transaction
             let num_confirmations = entry.num_confirmations.get();
             entry.num_confirmations.set(num_confirmations + U256::from(1));
+            // Set the transaction as confirmed by the sender.
             let mut tx_confirmed_info = self.is_confirmed.setter(tx_index);
             let mut confirmed_by_address = tx_confirmed_info.setter(msg::sender());
             confirmed_by_address.set(true);
 
+            // Emit the `ConfirmTransaction` event.
             evm::log(ConfirmTransaction {
                 owner: msg::sender(),
                 txIndex: U256::from(tx_index),
@@ -218,8 +249,10 @@ impl Counter {
         }
     }
 
+    // The `revoke_confirmation` method revokes a confirmation for a transaction.
     pub fn revoke_confirmation(&mut self, tx_index: U256) -> Result<(), MultiSigError> {
-        if !self.is_owner(msg::sender()) {
+        // The sender must be an owner.
+        if !self.is_owner.get(msg::sender()) {
             return Err(MultiSigError::NotOwner(NotOwner{}));
         }
         // let tx_index = tx_index.to;
@@ -227,17 +260,23 @@ impl Counter {
             return Err(MultiSigError::TxDoesNotExist(TxDoesNotExist{}));
         }
 
+        // Try get transaction and check transaction is valid or not, if valid, revoke it, if not, revert tx.
         if let Some(mut entry) = self.transactions.get_mut(tx_index) {
+            // Check if the transaction has been confirmed or not
             if !self.is_confirmed.get(tx_index).get(msg::sender()) {
+                // If the transaction has not been confirmed, return an error.
                 return Err(MultiSigError::TxNotConfirmed(TxNotConfirmed{}));
             }
 
+            //  Revoke the transaction
             let num_confirmations = entry.num_confirmations.get();
             entry.num_confirmations.set(num_confirmations - U256::from(1));
+            // Set the transaction as not confirmed by the sender.
             let mut tx_confirmed_info = self.is_confirmed.setter(tx_index);
             let mut confirmed_by_address = tx_confirmed_info.setter(msg::sender());
             confirmed_by_address.set(false);
 
+            //  Emit the `RevokeConfirmation` event.
             evm::log(RevokeConfirmation {
                 owner: msg::sender(),
                 txIndex: U256::from(tx_index),
@@ -248,39 +287,14 @@ impl Counter {
         }
     }
 
+    // The `is_owner` method checks if an address is an owner.
     pub fn is_owner(&self, check_address: Address) -> bool {
-        let mut i = 0;
-        let len = self.owners.len();
-        while i < len {
-            if self.owners.get(i) == Some(check_address) {
-                return true;
-            }
-            i += 1;
-        }
-        return false;
+        self.is_owner.get(check_address)
     }
 
+    // The `get_transaction_count` method returns the number of transactions.
     pub fn get_transaction_count(&self) -> U256 {
         U256::from(self.transactions.len())
-    }
-
-    pub fn get_transaction(&self, tx_index: U256) -> Result<(Address, U256, Vec<u8>, bool, U256), MultiSigError> {
-        let tx_index = tx_index.to::<usize>();
-        if tx_index >= self.transactions.len() {
-            return Err(MultiSigError::TxDoesNotExist(TxDoesNotExist{}));
-        }
-
-        if let Some(entry) = self.transactions.get(tx_index) {
-            Ok((
-                entry.to.get(),
-                entry.value.get(),
-                entry.data.get_bytes(),
-                entry.executed.get(),
-                entry.num_confirmations.get(),
-            ))
-        } else {
-            return Err(MultiSigError::TxDoesNotExist(TxDoesNotExist{}));
-        }
     }
 }
 
